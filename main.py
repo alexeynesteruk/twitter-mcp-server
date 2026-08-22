@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="twitter-mcp-server",
     host=HOST,
-    port=int(PORT),
+    port=int(PORT) if PORT else 3000,
     streamable_http_path="/mcp",
 )
 mcp.streamable_http_app()
@@ -417,8 +418,19 @@ def set_auth_context(auth: AuthContext | None) -> None:
 
 
 def get_auth_context() -> AuthContext | None:
-    """Get the authentication context from the current async context."""
-    return _auth_context.get()
+    """Get the authentication context from the current async context.
+
+    Falls back to TWITTER_AUTH_TOKEN/TWITTER_CT0 env vars when running over
+    stdio, where there is no HTTP request to carry the Authorization header.
+    """
+    ctx = _auth_context.get()
+    if ctx is not None:
+        return ctx
+    env_auth_token = os.getenv("TWITTER_AUTH_TOKEN")
+    env_ct0 = os.getenv("TWITTER_CT0")
+    if env_auth_token and env_ct0:
+        return AuthContext(env_auth_token, env_ct0)
+    return None
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
