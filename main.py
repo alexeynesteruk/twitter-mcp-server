@@ -1,96 +1,196 @@
-import asyncio
 import json
 import logging
 import os
-from contextvars import ContextVar
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, Optional
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from starlette.middleware.cors import CORSMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 from twikit import Client, errors
+from twikit.tweet import Tweet, tweet_from_data
 
 from config import HOST, PORT
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP(
-    name="twitter-mcp-server",
-    host=HOST,
-    port=int(PORT) if PORT else 3000,
-    streamable_http_path="/mcp",
+mcp = MCPServer(name="twitter-mcp-server")
+# httpx logs every X request URL at INFO; keep the MCP client's stderr readable.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+MAX_COUNT = 50
+AUTH_REQUIRED = "Authentication required: AUTH_REQUIRED"
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# Toggles (like/unlike, follow/unfollow, retweet/undo) can be reversed.
+TOGGLE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
-mcp.streamable_http_app()
+PUBLISH = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
 
 
-@mcp.tool(description="Get recent tweets from a user")
-async def get_tweets(username: str, count: str = "30") -> str:
+@dataclass(frozen=True)
+class AuthContext:
+    auth_token: str
+    ct0: str
+
+
+def parse_bearer(header: str) -> AuthContext:
+    """Parse `Authorization: Bearer <auth_token>:<ct0>`."""
+    parts = header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise ToolError(
+            f"{AUTH_REQUIRED} (expected 'Authorization: Bearer <auth_token>:<ct0>')"
+        )
+    auth_token, sep, ct0 = parts[1].partition(":")
+    if not sep or not auth_token or not ct0:
+        raise ToolError(f"{AUTH_REQUIRED} (bearer token must be <auth_token>:<ct0>)")
+    return AuthContext(auth_token, ct0)
+
+
+def get_auth_context(headers: Mapping[str, str] | None) -> AuthContext:
+    """Resolve the X session cookies for one tool call.
+
+    Over HTTP the caller must send its own cookies in the Authorization header;
+    the server never falls back to its own env cookies there, so a web page
+    that can reach the port cannot act as the server owner. Over stdio
+    (headers is None) the cookies come from TWITTER_AUTH_TOKEN/TWITTER_CT0.
+    """
+    if headers is not None:
+        header = headers.get("authorization")
+        if not header:
+            raise ToolError(AUTH_REQUIRED)
+        return parse_bearer(header)
+    auth_token = os.getenv("TWITTER_AUTH_TOKEN")
+    ct0 = os.getenv("TWITTER_CT0")
+    if not auth_token or not ct0:
+        raise ToolError(f"{AUTH_REQUIRED} (set TWITTER_AUTH_TOKEN and TWITTER_CT0)")
+    return AuthContext(auth_token, ct0)
+
+
+# One twikit Client per cookie pair, so the x.com transaction keys are fetched
+# once instead of on every call.
+_clients: dict[AuthContext, Client] = {}
+_MAX_CLIENTS = 32
+
+
+def get_client(ctx: Context | None) -> Client:
+    auth = get_auth_context(ctx.headers if ctx is not None else None)
+    client = _clients.get(auth)
+    if client is None:
+        if len(_clients) >= _MAX_CLIENTS:
+            _clients.clear()
+        client = Client("en-US")
+        client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
+        _clients[auth] = client
+    return client
+
+
+@contextmanager
+def twitter_errors() -> Iterator[None]:
+    """Turn twikit exceptions into short, actionable tool errors."""
+    try:
+        yield
+    except errors.Unauthorized:
+        raise ToolError(
+            f"{AUTH_REQUIRED} (X rejected the session cookies; refresh auth_token/ct0)"
+        ) from None
+    except errors.Forbidden as e:
+        raise ToolError(f"{AUTH_REQUIRED} (X returned 403: {e})") from None
+    except errors.TooManyRequests as e:
+        reset = ""
+        if e.rate_limit_reset:
+            reset = f"; resets at {datetime.fromtimestamp(e.rate_limit_reset, UTC).isoformat()}"
+        raise ToolError(f"Rate limited by X{reset}") from None
+    except (errors.UserNotFound, errors.UserUnavailable) as e:
+        raise ToolError(f"User not found or unavailable: {e}") from None
+    except (errors.TweetNotAvailable, errors.NotFound) as e:
+        raise ToolError(f"Not found: {e}") from None
+    except errors.TwitterException as e:
+        raise ToolError(f"X request failed: {type(e).__name__}: {e}") from None
+    except (KeyError, IndexError, TypeError) as e:
+        # X reshapes its GraphQL responses every few months and twikit parses
+        # them by fixed keys; say so instead of a bare "Error executing tool".
+        logger.exception("Unexpected X response shape")
+        raise ToolError(
+            f"Unexpected X response shape ({type(e).__name__}: {e}); "
+            "twikit likely needs re-patching"
+        ) from None
+    except Exception as e:
+        # twikit raises a bare Exception when x.com serves a page without the
+        # ondemand.s script: a logged-out page (bad cookies) or a format change.
+        if "KEY_BYTE" not in str(e):
+            raise
+        raise ToolError(
+            f"{AUTH_REQUIRED} (X client handshake failed: {e}). Usually invalid or "
+            "expired auth_token/ct0; if the cookies are fresh, X changed its "
+            "ondemand.s format and twikit needs re-patching"
+        ) from None
+
+
+def parse_count(count: int | str) -> int:
+    try:
+        count_int = int(count)
+    except (TypeError, ValueError):
+        raise ToolError("Invalid argument (count)") from None
+    if count_int > MAX_COUNT:
+        raise ToolError(f"Invalid argument (count): max value is {MAX_COUNT}")
+    if count_int <= 0:
+        raise ToolError("Invalid argument (count): must be at least 1")
+    return count_int
+
+
+def tweet_to_dict(tweet: Tweet) -> dict[str, Any]:
+    return {
+        "id": tweet.id,
+        "in_reply_to": tweet.in_reply_to,
+        "author_username": tweet.user.screen_name,
+        "text": tweet.text,
+        "lang": tweet.lang,
+        "created_at": tweet.created_at,
+        "view_count": tweet.view_count,
+        "favorite_count": tweet.favorite_count,
+        "reply_count": tweet.reply_count,
+        "retweet_count": tweet.retweet_count,
+    }
+
+
+def tweets_json(tweets, count: int) -> str:
+    # X treats count as a hint and often returns a few pages' worth.
+    return json.dumps([tweet_to_dict(t) for t in list(tweets)[:count]])
+
+
+@mcp.tool(description="Get recent tweets from a user", annotations=READ_ONLY)
+async def get_tweets(username: str, count: int = 30, ctx: Context | None = None) -> str:
     """
     Args:
       username: Username of the user (without @)
       count: Number of tweets to retrieve (default: 30, max: 50)
     """
-    try:
-        count_int = int(count)
-    except ValueError:
-        raise RuntimeError("Invalid argument (count)") from None
-    if count_int > 50:
-        raise RuntimeError("Invalid argument (count): max value is 50")
-    if count_int <= 0:
-        raise RuntimeError("Invalid argument (count): count cant be less then 0")
-
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-    try:
+    count_int = parse_count(count)
+    client = get_client(ctx)
+    with twitter_errors():
         user = await client.get_user_by_screen_name(username)
         tweets = await client.get_user_tweets(user.id, "Tweets", count=count_int)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
-    result = []
-    for tweet in tweets:
-        result.append(
-            {
-                "id": tweet.id,
-                "in_reply_to": tweet.in_reply_to,
-                "author_username": tweet.user.screen_name,
-                "text": tweet.text,
-                "lang": tweet.lang,
-                "created_at": tweet.created_at,
-                "view_count": tweet.view_count,
-                "favorite_count": tweet.favorite_count,
-                "reply_count": tweet.reply_count,
-                "retweet_count": tweet.retweet_count,
-            }
-        )
-    return json.dumps(result)
+    return tweets_json(tweets, count_int)
 
 
-@mcp.tool(description="Get a Twitter user's profile information")
-async def get_profile(username: str) -> str:
+@mcp.tool(description="Get a Twitter user's profile information", annotations=READ_ONLY)
+async def get_profile(username: str, ctx: Context | None = None) -> str:
     """
     Args:
       username: Username of the user (without @)
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-
-    try:
+    client = get_client(ctx)
+    with twitter_errors():
         user = await client.get_user_by_screen_name(username)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
 
     return json.dumps(
         {
@@ -115,390 +215,226 @@ async def get_profile(username: str) -> str:
     )
 
 
-@mcp.tool(description="Search for tweets by hashtag or keyword")
+@mcp.tool(description="Search for tweets by hashtag or keyword", annotations=READ_ONLY)
 async def search_tweets(
-    query: str, mode: Literal["Latest", "Top"] = "Top", count: str = "30"
+    query: str,
+    mode: Literal["Latest", "Top"] = "Top",
+    count: int = 30,
+    ctx: Context | None = None,
 ) -> str:
     """
     Args:
       query: Search query (hashtag or keyword). For hashtags, include the # symbol
-      mode: Search mode - 'latest' for most recent tweets or 'top' for most relevant tweets (default: 'top')
+      mode: 'Latest' for most recent tweets or 'Top' for most relevant tweets (default: 'Top')
       count: Number of tweets to retrieve (default: 30, max: 50)
     """
-    try:
-        count_int = int(count)
-    except ValueError:
-        raise RuntimeError("Invalid argument (count)") from None
-    if count_int > 50:
-        raise RuntimeError("Invalid argument (count): max value is 50")
-    if count_int <= 0:
-        raise RuntimeError("Invalid argument (count): count cant be less then 0")
-
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-    try:
+    count_int = parse_count(count)
+    client = get_client(ctx)
+    with twitter_errors():
         tweets = await client.search_tweet(query, mode, count=count_int)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
-    result = []
-    for tweet in tweets:
-        result.append(
-            {
-                "id": tweet.id,
-                "in_reply_to": tweet.in_reply_to,
-                "author_username": tweet.user.screen_name,
-                "text": tweet.text,
-                "lang": tweet.lang,
-                "created_at": tweet.created_at,
-                "view_count": tweet.view_count,
-                "favorite_count": tweet.favorite_count,
-                "reply_count": tweet.reply_count,
-                "retweet_count": tweet.retweet_count,
-            }
-        )
-    return json.dumps(result)
+    return tweets_json(tweets, count_int)
 
 
-@mcp.tool(description="Like or unlike a tweet")
-async def like_tweet(tweet_id: str, action: Literal["like", "unlike"] = "like") -> str:
+@mcp.tool(description="Like or unlike a tweet", annotations=TOGGLE)
+async def like_tweet(
+    tweet_id: str,
+    action: Literal["like", "unlike"] = "like",
+    ctx: Context | None = None,
+) -> str:
     """
     Args:
       tweet_id: ID of the tweet to like/unlike
-      action: Whether to \"like\" or \"unlike\" the tweet
+      action: Whether to "like" or "unlike" the tweet
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-
-    try:
+    client = get_client(ctx)
+    with twitter_errors():
         if action == "like":
             await client.favorite_tweet(tweet_id)
-        elif action == "unlike":
+        else:
             await client.unfavorite_tweet(tweet_id)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
     return json.dumps({"status": "success"})
 
 
-@mcp.tool(description="Retweet or undo retweet of a tweet")
-async def retweet(tweet_id: str, action: Literal["retweet", "undo"] = "retweet") -> str:
+@mcp.tool(description="Retweet or undo retweet of a tweet", annotations=TOGGLE)
+async def retweet(
+    tweet_id: str,
+    action: Literal["retweet", "undo"] = "retweet",
+    ctx: Context | None = None,
+) -> str:
     """
     Args:
       tweet_id: ID of the tweet to retweet/undo retweet
-      action: Whether to \"retweet\" or \"undo\" the retweet
+      action: Whether to "retweet" or "undo" the retweet
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-
-    try:
+    client = get_client(ctx)
+    with twitter_errors():
         if action == "retweet":
             await client.retweet(tweet_id)
-        elif action == "undo":
+        else:
             await client.delete_retweet(tweet_id)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
     return json.dumps({"status": "success"})
 
 
-@mcp.tool(description="Post a new tweet, optionally with media or as a quote tweet")
+@mcp.tool(description="Post a new tweet, optionally as a reply", annotations=PUBLISH)
 async def post_tweet(
     text: str,
     reply_to_tweet_id: str = "",
+    ctx: Context | None = None,
 ) -> str:
     """
     Args:
       text: The text content of the tweet limited to 280 characters
       reply_to_tweet_id: Optional ID of the tweet to reply to
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-    try:
-        await client.create_tweet(
-            text=text, reply_to=None if reply_to_tweet_id == "" else reply_to_tweet_id
-        )
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
-    return json.dumps({"status": "success"})
+    client = get_client(ctx)
+    with twitter_errors():
+        tweet = await client.create_tweet(text=text, reply_to=reply_to_tweet_id or None)
+    return json.dumps({"status": "success", "id": getattr(tweet, "id", None)})
 
 
-@mcp.tool(description="Get current trending topics on Twitter")
+@mcp.tool(description="Get current trending topics on Twitter", annotations=READ_ONLY)
 async def get_trends(
     category: Literal[
         "trending", "for-you", "news", "sports", "entertainment"
     ] = "trending",
-    count: str = "30",
+    count: int = 30,
+    ctx: Context | None = None,
 ) -> str:
     """
     Args:
-      category: Search mode - 'trending' for overall trends, 'for-you', 'news', 'sports', 'entertainment' for more specific trends
+      category: 'trending' for overall trends, 'for-you', 'news', 'sports', 'entertainment' for more specific trends
       count: Number of trends to retrieve (default: 30, max: 50)
     """
-    try:
-        count_int = int(count)
-    except ValueError:
-        raise RuntimeError("Invalid argument (count)") from None
-    if count_int > 50:
-        raise RuntimeError("Invalid argument (count): max value is 50")
-    if count_int <= 0:
-        raise RuntimeError("Invalid argument (count): count cant be less then 0")
-
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-
-    try:
+    count_int = parse_count(count)
+    client = get_client(ctx)
+    with twitter_errors():
         trends = await client.get_trends(category, count=count_int, retry=False)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
 
-    result = []
-    for trend in trends:
-        result.append(
-            {
-                "name": trend.name,
-                "tweet_count": trend.tweets_count,
-                "grouped_trends": trend.grouped_trends,
-                "domain_context": trend.domain_context,
-            }
-        )
+    result = [
+        {
+            "name": trend.name,
+            "tweet_count": trend.tweets_count,
+            "grouped_trends": trend.grouped_trends,
+            "domain_context": trend.domain_context,
+        }
+        for trend in list(trends)[:count_int]
+    ]
     return json.dumps(result)
 
 
-@mcp.tool(description="Get tweets from a user's home personalized timeline")
+@mcp.tool(
+    description="Get tweets from a user's home personalized timeline",
+    annotations=READ_ONLY,
+)
 async def get_timeline(
-    category: Literal["for-you", "following"] = "for-you", count: str = "40"
+    category: Literal["for-you", "following"] = "for-you",
+    count: int = 40,
+    ctx: Context | None = None,
 ) -> str:
     """
     Args:
-      category: mode - 'for-you' for personalized home for-you feed, 'following' for your following timeline
+      category: 'for-you' for personalized home for-you feed, 'following' for your following timeline
       count: Number of tweets to retrieve (default: 40, max: 50)
     """
-    try:
-        count_int = int(count)
-    except ValueError:
-        raise RuntimeError("Invalid argument (count)") from None
-    if count_int > 50:
-        raise RuntimeError("Invalid argument (count): max value is 50")
-    if count_int <= 0:
-        raise RuntimeError("Invalid argument (count): count cant be less then 0")
-
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-    try:
+    count_int = parse_count(count)
+    client = get_client(ctx)
+    with twitter_errors():
         if category == "for-you":
             tweets = await client.get_timeline(count=count_int)
-        elif category == "following":
+        else:
             tweets = await client.get_latest_timeline(count=count_int)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
-    result = []
-    for tweet in tweets:
-        result.append(
-            {
-                "id": tweet.id,
-                "in_reply_to": tweet.in_reply_to,
-                "author_username": tweet.user.screen_name,
-                "text": tweet.text,
-                "lang": tweet.lang,
-                "created_at": tweet.created_at,
-                "view_count": tweet.view_count,
-                "favorite_count": tweet.favorite_count,
-                "reply_count": tweet.reply_count,
-                "retweet_count": tweet.retweet_count,
-            }
-        )
-    return json.dumps(result)
+    return tweets_json(tweets, count_int)
 
 
-@mcp.tool(description="Follow or unfollow a Twitter user")
+@mcp.tool(description="Follow or unfollow a Twitter user", annotations=TOGGLE)
 async def follow_user(
-    username: str, action: Literal["follow", "unfollow"] = "follow"
+    username: str,
+    action: Literal["follow", "unfollow"] = "follow",
+    ctx: Context | None = None,
 ) -> str:
     """
     Args:
       username: Username of the user to follow/unfollow (without @)
       action: Whether to follow or unfollow the user
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-    try:
+    client = get_client(ctx)
+    with twitter_errors():
         user = await client.get_user_by_screen_name(username)
         if action == "follow":
             await client.follow_user(user.id)
-        elif action == "unfollow":
+        else:
             await client.unfollow_user(user.id)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
     return json.dumps({"status": "success"})
 
 
-@mcp.tool(description="Read replies under post")
-async def get_replies(tweet_id: str) -> str:
+def replies_from_tweet_detail(
+    client: Client, tweet_id: str, response: dict
+) -> list[Tweet]:
+    """Pull the direct replies out of a TweetDetail GraphQL response.
+
+    twikit's own get_tweet_by_id breaks on the current response shape (the
+    bottom cursor moved from content.itemContent.value to content.value), so
+    this reads only what get_replies needs. Each conversationthread-* module
+    starts with a direct reply; the rest of the module is its sub-thread.
+    """
+    conversation = (response.get("data") or {}).get(
+        "threaded_conversation_with_injections_v2"
+    )
+    not_found = ToolError(
+        f"Not found: tweet {tweet_id} is deleted, protected or unavailable"
+    )
+    if not conversation:
+        raise not_found
+    focal_found = False
+    replies = []
+    for instruction in conversation.get("instructions", []):
+        for entry in instruction.get("entries", []):
+            entry_id = entry.get("entryId", "")
+            if entry_id == f"tweet-{tweet_id}":
+                # X still sends the focal entry for a missing tweet, just empty.
+                focal_found = tweet_from_data(client, entry) is not None
+                continue
+            if not entry_id.startswith("conversationthread-"):
+                continue
+            items = entry.get("content", {}).get("items") or []
+            reply = tweet_from_data(client, items[0]) if items else None
+            if reply is not None:
+                replies.append(reply)
+    if not focal_found:
+        raise not_found
+    return replies
+
+
+@mcp.tool(description="Read replies under post", annotations=READ_ONLY)
+async def get_replies(
+    tweet_id: str, count: int = 30, ctx: Context | None = None
+) -> str:
     """
     Args:
         tweet_id: ID of the tweet to get replies of
+        count: Maximum number of replies to return (default: 30, max: 50)
     """
-    auth = get_auth_context()
-    if auth is None:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED")
-
-    client = Client("en-US")
-    client.set_cookies({"auth_token": auth.auth_token, "ct0": auth.ct0})
-
-    try:
-        tweet = await client.get_tweet_by_id(tweet_id)
-    except errors.Forbidden:
-        raise RuntimeError("Authentication required: AUTH_REQUIRED") from None
-
-    result = []
-    for reply in tweet.replies or []:
-        result.append(
-            {
-                "id": reply.id,
-                "in_reply_to": reply.in_reply_to,
-                "author_username": reply.user.screen_name,
-                "text": reply.text,
-                "lang": reply.lang,
-                "created_at": reply.created_at,
-                "view_count": reply.view_count,
-                "favorite_count": reply.favorite_count,
-                "reply_count": reply.reply_count,
-                "retweet_count": reply.retweet_count,
-            }
-        )
-    return json.dumps(result)
+    count_int = parse_count(count)
+    client = get_client(ctx)
+    with twitter_errors():
+        response, _ = await client.gql.tweet_detail(tweet_id, None)
+    return tweets_json(replies_from_tweet_detail(client, tweet_id, response), count_int)
 
 
-_auth_context: ContextVar[Optional["AuthContext"]] = ContextVar(
-    "auth_context", default=None
-)
-
-
-@dataclass
-class AuthContext:
-    auth_token: str
-    ct0: str
-
-
-def set_auth_context(auth: AuthContext | None) -> None:
-    """Set the authentication context for the current async context."""
-    _auth_context.set(auth)
-
-
-def get_auth_context() -> AuthContext | None:
-    """Get the authentication context from the current async context.
-
-    Falls back to TWITTER_AUTH_TOKEN/TWITTER_CT0 env vars when running over
-    stdio, where there is no HTTP request to carry the Authorization header.
-    """
-    ctx = _auth_context.get()
-    if ctx is not None:
-        return ctx
-    env_auth_token = os.getenv("TWITTER_AUTH_TOKEN")
-    env_ct0 = os.getenv("TWITTER_CT0")
-    if env_auth_token and env_ct0:
-        return AuthContext(env_auth_token, env_ct0)
-    return None
-
-
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-
-        if request.url.path in ["/health", "/docs", "/.well-known/health"]:
-            return await call_next(request)
-
-        auth_header = request.headers.get("Authorization")
-
-        if not auth_header:
-            return await call_next(request)
-
-        parts = auth_header.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer":
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Invalid Authorization header format"},
-            )
-
-        token = parts[1]
-        token_parts = token.split(sep=":")
-        auth_token = token_parts[0]
-        csrf_token = token_parts[1]
-
-        if not self.validate_auth_token(auth_token) or not self.validate_csrf_token(
-            csrf_token
-        ):
-            return JSONResponse(
-                status_code=401, content={"error": "Invalid or expired token"}
-            )
-
-        set_auth_context(AuthContext(auth_token, csrf_token))
-        response = await call_next(request)
-        return response
-
-    def validate_auth_token(self, token: str) -> bool:
-        return len(token) > 0
-
-    def validate_csrf_token(self, token: str) -> bool:
-        return len(token) > 0
-
-
-async def main():
+def main() -> None:
     if PORT:
-        mcp_app = mcp.streamable_http_app()
-        mcp_app.add_middleware(AuthMiddleware)
-        mcp_app.add_middleware(
+        app = mcp.streamable_http_app(host=HOST)
+        app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
-            expose_headers=["X-Session-ID", "mcp-session-id"],
+            expose_headers=["mcp-session-id"],
         )
-        config = uvicorn.Config(
-            mcp_app,
-            host=mcp.settings.host,
-            port=mcp.settings.port,
-            log_level=mcp.settings.log_level.lower(),
-        )
-        server = uvicorn.Server(config)
-        await server.serve()
+        uvicorn.run(app, host=HOST, port=int(PORT))
     else:
-        await mcp.run_stdio_async()
+        mcp.run("stdio")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

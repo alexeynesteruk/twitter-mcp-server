@@ -42,4 +42,5 @@ pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+asyncio_mode = "auto"
 addopts = "-v --cov=. --cov-report=term-missing --cov-report=xml"
