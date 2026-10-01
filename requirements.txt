@@ -1,6 +1,7 @@
 mcp>=2.2,<3
 python-dotenv>=1.1
 starlette>=1.0
+httpx>=0.28
 uvicorn>=0.54
 # twikit upstream (d60/twikit) has been broken against X since March 2026.
 # Pinned to an exact commit of the community patch so a force-push upstream

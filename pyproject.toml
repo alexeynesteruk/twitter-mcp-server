@@ -25,17 +25,6 @@ ignore = [
     "S106",  # hardcoded password arguments
 ]
 
-[tool.bandit]
-exclude_dirs = ["tests", "venv", ".venv"]
-skips = ["B101"]  # Skip assert_used (covered by ruff)
-
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false  # Start lenient, tighten later
-ignore_missing_imports = true
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

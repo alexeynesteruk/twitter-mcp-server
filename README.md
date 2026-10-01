@@ -67,9 +67,23 @@ Connect to `http://localhost:3000/mcp`. Every request must carry its own cookies
 Authorization: Bearer <auth_token>:<ct0>
 ```
 
-In HTTP mode the server never falls back to the cookies in its own `.env`, so
-anything that can reach the port cannot act as the server owner. On localhost,
-requests with a foreign `Origin` are rejected (DNS-rebinding protection).
+In HTTP mode (decided by `APP_PORT`, not by the request) the server never falls
+back to the cookies in its own `.env`, so anything that can reach the port
+cannot act as the server owner. On localhost, requests with a foreign `Host` or
+`Origin` are rejected (DNS-rebinding protection).
+
+The cookies travel in plaintext, so put a TLS proxy in front of anything that
+is not localhost. Binding `APP_HOST=0.0.0.0` (needed inside Docker) turns the
+Host/Origin checks off.
+
+### Docker
+
+```bash
+docker build -t twitter-mcp-server .
+docker run --rm -e APP_PORT=3000 -e APP_HOST=0.0.0.0 -p 127.0.0.1:3000:3000 twitter-mcp-server
+```
+
+`.dockerignore` keeps `.env`, `.venv` and `.git` out of the image.
 
 ## Errors
 
