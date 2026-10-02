@@ -6,4 +6,4 @@ uvicorn>=0.54
 # twikit upstream (d60/twikit) has been broken against X since March 2026.
 # Pinned to an exact commit of the community patch so a force-push upstream
 # can't change what gets installed.
-twikit @ git+https://github.com/leslienwu/twikit-patched.git@73e6d175ffefb547387321d2ca389bce592d276c
+twikit @ git+https://github.com/leslienwu/twikit-patched.git@684f23ba960d5330a214f6f2a6611b45c02426b0

@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -11,6 +13,7 @@ import pytest
 from mcp import Client as MCPClient
 from mcp.server.mcpserver.exceptions import ToolError
 from twikit import errors
+from twikit.tweet import tweet_from_data
 
 import main
 from main import (
@@ -29,6 +32,32 @@ from main import (
     search_tweets,
     twitter_errors,
 )
+from main import XTransaction as RealXTransaction
+
+
+class NoNetworkTransaction:
+    """Default in tests: any real x.com handshake is a test bug."""
+
+    def __init__(self):
+        self.home_page_response = None
+
+    async def init(self, session, headers):
+        raise AssertionError("test tried a real x.com handshake")
+
+
+@pytest.fixture(autouse=True)
+def no_network_handshake(monkeypatch):
+    monkeypatch.setattr(main, "XTransaction", NoNetworkTransaction)
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    # twikit ignores a transport= argument (its proxy setter rebuilds the
+    # mounts), so block real sockets at the transport itself.
+    async def refuse(self, request):
+        raise AssertionError(f"test tried a real request to {request.url.host}")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +76,15 @@ def make_tweet(i) -> Mock:
     tweet.in_reply_to = None
     tweet.user.screen_name = "testuser"
     tweet.text = f"tweet {i}"
+    tweet.full_text = f"tweet {i}"
+    tweet.urls = []
+    tweet.retweeted_tweet = None
+    tweet.quote = None
+    tweet.media = []
+    tweet.replies = None
     tweet.lang = "en"
     tweet.created_at = "2024-01-01"
-    tweet.view_count = 100
+    tweet.view_count = "100"
     tweet.favorite_count = 10
     tweet.reply_count = 5
     tweet.retweet_count = 2
@@ -75,6 +110,11 @@ def make_user(username: str = "testuser") -> SimpleNamespace:
         fast_followers_count=0,
         normal_followers_count=1000,
         following_count=500,
+        statuses_count=42,
+        protected=False,
+        following=False,
+        followed_by=None,
+        urls=[],
     )
 
 
@@ -82,6 +122,8 @@ def new_twikit_mock() -> Mock:
     client = Mock()
     client.handshake = AsyncMock()
     client.http.aclose = AsyncMock()
+    client.inflight = 0
+    client.evicted = False
     return client
 
 
@@ -169,7 +211,7 @@ class FakeTransaction:
 def fake_transaction(monkeypatch):
     FakeTransaction.made = 0
     FakeTransaction.fail_next = 0
-    monkeypatch.setattr(main, "ClientTransaction", FakeTransaction)
+    monkeypatch.setattr(main, "XTransaction", FakeTransaction)
     return FakeTransaction
 
 
@@ -234,7 +276,7 @@ async def test_xclient_wraps_every_bare_handshake_failure(monkeypatch, message):
         async def init(self, session, headers):
             raise Exception(message)
 
-    monkeypatch.setattr(main, "ClientTransaction", Broken)
+    monkeypatch.setattr(main, "XTransaction", Broken)
     with pytest.raises(main.HandshakeError, match=message):
         await main.XClient("en-US").handshake()
 
@@ -244,7 +286,7 @@ async def test_xclient_handshake_keeps_network_and_x_errors(monkeypatch):
         async def init(self, session, headers):
             raise httpx.ConnectError("offline")
 
-    monkeypatch.setattr(main, "ClientTransaction", Offline)
+    monkeypatch.setattr(main, "XTransaction", Offline)
     with pytest.raises(httpx.ConnectError):
         await main.XClient("en-US").handshake()
 
@@ -353,6 +395,16 @@ async def test_tools_reject_bad_count(count, message):
     [
         (errors.Unauthorized("401"), "AUTH_REQUIRED.*refresh"),
         (errors.Forbidden("403"), "AUTH_REQUIRED.*403"),
+        (errors.Forbidden('{"errors":[{"code":353}]}'), "AUTH_REQUIRED"),
+        (
+            errors.Forbidden(
+                '{"errors":[{"code":161,"message":"unable to follow more"}]}'
+            ),
+            "X refused the request \\(403, code 161\\)",
+        ),
+        (errors.AccountLocked("locked"), "account is locked"),
+        (errors.AccountSuspended("suspended"), "account is suspended"),
+        (main.TransactionRejected("/x: 404"), "kept rejecting the request"),
         (errors.UserNotFound("gone"), "User not found"),
         (errors.TweetNotAvailable("gone"), "Not found"),
         (errors.NotFound("404"), "Not found"),
@@ -362,7 +414,7 @@ async def test_tools_reject_bad_count(count, message):
         (AttributeError("json"), "Unexpected X response shape"),
         (
             main.HandshakeError("Couldn't get key from the page source"),
-            "AUTH_REQUIRED.*handshake",
+            "HANDSHAKE_FAILED",
         ),
     ],
 )
@@ -402,6 +454,7 @@ async def test_lazy_tweet_field_shape_error_is_tool_error(twikit_client):
     class BrokenTweet:
         id = "1"
         in_reply_to = None
+        retweeted_tweet = None
 
         @property
         def user(self):
@@ -444,14 +497,14 @@ async def test_like_tweet_reports_rejection(twikit_client):
 
 
 async def test_get_tweets_success_and_truncates(twikit_client):
-    twikit_client.get_user_by_screen_name = AsyncMock(return_value=Mock(id="123"))
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
     twikit_client.get_user_tweets = AsyncMock(
-        return_value=[make_tweet(i) for i in range(14)]
+        return_value=[make_tweet(i) for i in range(113, 99, -1)]  # newest first
     )
 
     data = json.loads(await get_tweets("testuser", count=5))
 
-    assert [t["id"] for t in data] == ["0", "1", "2", "3", "4"]
+    assert [t["id"] for t in data] == ["113", "112", "111", "110", "109"]
     assert data[0]["author_username"] == "testuser"
     twikit_client.get_user_tweets.assert_called_once_with("123", "Tweets", count=5)
 
@@ -773,6 +826,7 @@ def raw_tweet(tid, reply_to=None, quoted=None) -> dict:
             "favorite_count": 0,
             "retweet_count": 0,
             "is_quote_status": False,
+            "entities": {"urls": []},
         },
     }
     if quoted:
@@ -963,3 +1017,659 @@ async def test_get_timeline(twikit_client, category, method):
     data = json.loads(await main.get_timeline(category=category, count=5))
     assert len(data) == 5
     getattr(twikit_client, method).assert_called_once_with(count=5)
+
+
+# ============================================================================
+# Round 3: transaction-id math, 429 recursion, pagination, tweet content
+# ============================================================================
+
+VECTORS = json.loads(
+    (Path(__file__).parent / "fixtures" / "transaction_vectors.json").read_text()
+)
+
+
+@pytest.mark.parametrize("vector", VECTORS, ids=range(len(VECTORS)))
+def test_xtransaction_matches_reference_animation_key(vector):
+    # Expected keys come from iSarabjitDhiman/XClientTransaction 1.0.3.
+    transaction = RealXTransaction()
+    transaction.DEFAULT_ROW_INDEX = vector["row_index"]
+    transaction.DEFAULT_KEY_BYTES_INDICES = vector["indices"]
+    transaction.get_2d_array = lambda key_bytes, response: vector["frames"]
+    assert (
+        transaction.get_animation_key(vector["key_bytes"], None) == vector["expected"]
+    )
+
+
+def test_vectors_cover_the_twikit_bug():
+    # The fixture must contain keys where twikit's vendored math is wrong,
+    # otherwise the test above proves nothing.
+    assert sum(v["twikit_differs"] for v in VECTORS) >= 3
+    assert sum(not v["twikit_differs"] for v in VECTORS) >= 1
+
+
+def test_js_round_rounds_halves_up():
+    assert [main.js_round(x) for x in (0.5, 1.5, 2.5, 7.49, -0.5)] == [1, 2, 3, 7, 0]
+
+
+async def test_get_user_state_does_not_recurse_on_429(monkeypatch):
+    calls = 0
+
+    async def user_state(self):
+        nonlocal calls
+        calls += 1
+        # What twikit's request() does on a 429: check the account state.
+        return await self._get_user_state()
+
+    monkeypatch.setattr(main.Client, "_get_user_state", user_state)
+    client = main.XClient("en-US")
+    assert await client._get_user_state() == "normal"
+    assert calls == 1
+
+
+async def test_get_user_state_rate_limited_is_normal(monkeypatch):
+    async def user_state(self):
+        raise errors.TooManyRequests("429")
+
+    monkeypatch.setattr(main.Client, "_get_user_state", user_state)
+    assert await main.XClient("en-US")._get_user_state() == "normal"
+
+
+class Page(list):
+    """Stands in for twikit's Result: a list with a cursor and next()."""
+
+    def __init__(self, items, pages=(), end_error=None):
+        super().__init__(items)
+        self._pages = list(pages)
+        self._end_error = end_error
+        self.next_cursor = "c" if (self._pages or end_error) else None
+
+    async def next(self):
+        if not self._pages:
+            raise self._end_error
+        return Page(self._pages[0], self._pages[1:], self._end_error)
+
+
+async def test_collect_follows_cursors_until_count():
+    page = Page(
+        [make_tweet(i) for i in range(11)], [[make_tweet(i) for i in range(11, 22)]] * 3
+    )
+    got = await main.collect(page, 30)
+    assert [t.id for t in got] == [str(i) for i in range(22)]  # duplicates dropped
+
+
+async def test_collect_stops_at_end_of_timeline():
+    page = Page([make_tweet(1)], end_error=IndexError("list index out of range"))
+    assert [t.id for t in await main.collect(page, 50)] == ["1"]
+
+
+async def test_collect_caps_pages(monkeypatch):
+    monkeypatch.setattr(main, "MAX_PAGES", 2)
+    pages = [[make_tweet(i)] for i in range(2, 10)]
+    got = await main.collect(Page([make_tweet(1)], pages), 50)
+    assert len(got) == 2
+
+
+async def test_get_tweets_paginates(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    first = Page(
+        [make_tweet(i) for i in range(11)], [[make_tweet(i) for i in range(11, 22)]]
+    )
+    twikit_client.get_user_tweets = AsyncMock(return_value=first)
+    assert len(json.loads(await get_tweets("testuser", count=20))) == 20
+
+
+async def test_get_tweets_protected_not_followed(twikit_client):
+    user = make_user()
+    user.protected = True
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=user)
+    with pytest.raises(ToolError, match="protected and not followed"):
+        await get_tweets("testuser")
+
+
+async def test_get_tweets_account_without_tweets(twikit_client):
+    user = make_user()
+    user.statuses_count = 0
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=user)
+    twikit_client.get_user_tweets = AsyncMock(side_effect=IndexError)
+    assert json.loads(await get_tweets("testuser")) == []
+    twikit_client.get_user_tweets.assert_not_called()
+
+
+def real_tweet(raw: dict):
+    return tweet_from_data(Mock(), {"result": raw})
+
+
+def test_tweet_to_dict_long_form_note_tweet():
+    raw = raw_tweet("7")
+    raw["legacy"]["full_text"] = "Truncated legacy text… https://t.co/self"
+    raw["note_tweet"] = {
+        "note_tweet_results": {
+            "result": {
+                "text": "Full long-form text with a link https://t.co/abc &amp; more",
+                "entity_set": {
+                    "urls": [
+                        {
+                            "url": "https://t.co/abc",
+                            "expanded_url": "https://example.com/post",
+                        }
+                    ]
+                },
+            }
+        }
+    }
+    data = main.tweet_to_dict(real_tweet(raw))
+    assert (
+        data["text"]
+        == "Full long-form text with a link https://example.com/post & more"
+    )
+    assert data["url"] == "https://x.com/u/status/7"
+    assert data["view_count"] == 5
+
+
+def test_tweet_to_dict_retweet_reports_original():
+    original = raw_tweet("100")
+    original["legacy"]["full_text"] = "The original, complete post"
+    original["legacy"]["favorite_count"] = 99
+    rt = raw_tweet("200")
+    rt["legacy"]["full_text"] = "RT @u: The original, comp…"
+    rt["legacy"]["retweeted_status_result"] = {"result": original}
+    data = main.tweet_to_dict(real_tweet(rt))
+    assert data["id"] == "200"
+    assert data["text"] == "The original, complete post"
+    assert data["favorite_count"] == 99
+    assert data["retweet_of"]["id"] == "100"
+
+
+def test_tweet_to_dict_quote_and_tco_expansion():
+    quoted = raw_tweet("Q")
+    quoted["legacy"]["full_text"] = "quoted body"
+    raw = raw_tweet("8", quoted=quoted)
+    raw["legacy"]["full_text"] = "see https://t.co/x1 https://t.co/vid"
+    raw["legacy"]["entities"]["urls"] = [
+        {"url": "https://t.co/x1", "expanded_url": "https://a.b/c"}
+    ]
+    raw["legacy"]["entities"]["media"] = [
+        {
+            "type": "video",
+            "url": "https://t.co/vid",
+            "expanded_url": "https://x.com/u/status/8/video/1",
+        }
+    ]
+    data = main.tweet_to_dict(real_tweet(raw))
+    assert data["text"] == "see https://a.b/c"
+    assert data["media"] == [
+        {"type": "video", "url": "https://x.com/u/status/8/video/1"}
+    ]
+    assert data["quoted"] == {"id": "Q", "author_username": "u", "text": "quoted body"}
+    assert "retweet_of" not in data
+
+
+async def test_get_replies_follows_bottom_cursor(twikit_client):
+    first = raw_detail(raw_tweet("1"), [raw_module(str(i)) for i in range(2, 5)])
+    second = {
+        "data": {
+            "threaded_conversation_with_injections_v2": {
+                "instructions": [
+                    {
+                        "type": "TimelineAddEntries",
+                        "entries": [raw_module(str(i)) for i in range(4, 8)]
+                        + [{"entryId": "cursor-bottom-2", "content": {"value": "end"}}],
+                    }
+                ]
+            }
+        }
+    }
+    third = {"data": {"threaded_conversation_with_injections_v2": {"instructions": []}}}
+    twikit_client.gql.tweet_detail = AsyncMock(
+        side_effect=[(first, None), (second, None), (third, None)]
+    )
+    data = json.loads(await get_replies("1", count=50))
+    assert [t["id"] for t in data] == [
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+    ]  # "4" not duplicated
+    assert [c.args for c in twikit_client.gql.tweet_detail.await_args_list] == [
+        ("1", None),
+        ("1", "abc"),
+        ("1", "end"),
+    ]
+
+
+async def test_get_replies_single_page_when_count_met(twikit_client):
+    first = raw_detail(raw_tweet("1"), [raw_module(str(i)) for i in range(2, 6)])
+    twikit_client.gql.tweet_detail = AsyncMock(return_value=(first, None))
+    assert len(json.loads(await get_replies("1", count=3))) == 3
+    twikit_client.gql.tweet_detail.assert_awaited_once()
+
+
+def test_bottom_cursor_both_shapes():
+    new = {
+        "data": {
+            "threaded_conversation_with_injections_v2": {
+                "instructions": [
+                    {
+                        "entries": [
+                            {"entryId": "cursor-bottom-1", "content": {"value": "v1"}}
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+    old = {
+        "data": {
+            "threaded_conversation_with_injections_v2": {
+                "instructions": [
+                    {
+                        "entries": [
+                            {
+                                "entryId": "cursor-bottom-1",
+                                "content": {"itemContent": {"value": "v2"}},
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+    assert main.bottom_cursor(new) == "v1"
+    assert main.bottom_cursor(old) == "v2"
+    assert main.bottom_cursor({"data": {}}) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("27918", 27918), (5, 5), (None, None), ("n/a", None)]
+)
+def test_as_int(value, expected):
+    assert main.as_int(value) == expected
+
+
+# ============================================================================
+# Round 3 (review): arguments, errors, cache, timelines, threads, schema
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("OpenAI", "OpenAI"),
+        ("@OpenAI", "OpenAI"),
+        (" @OpenAI ", "OpenAI"),
+        ("https://x.com/OpenAI", "OpenAI"),
+        ("x.com/OpenAI/status/1", "OpenAI"),
+        ("https://twitter.com/OpenAI?s=20", "OpenAI"),
+    ],
+)
+def test_username_arg(value, expected):
+    assert main.username_arg(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "@", "not a name", "a" * 51])
+def test_username_arg_rejects(value):
+    with pytest.raises(ToolError, match="Invalid argument \\(username\\)"):
+        main.username_arg(value)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("2104982629884063840", "2104982629884063840"),
+        ("https://x.com/AnthropicAI/status/2104982629884063840", "2104982629884063840"),
+        ("https://twitter.com/a/statuses/123?s=20", "123"),
+    ],
+)
+def test_tweet_id_arg(value, expected):
+    assert main.tweet_id_arg(value) == expected
+
+
+def test_tweet_id_arg_rejects():
+    with pytest.raises(ToolError, match="Invalid argument \\(tweet_id\\)"):
+        main.tweet_id_arg("https://x.com/AnthropicAI")
+
+
+async def test_tools_normalize_arguments(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    await get_profile("@testuser")
+    twikit_client.get_user_by_screen_name.assert_awaited_once_with("testuser")
+    twikit_client.favorite_tweet = AsyncMock(return_value=httpx.Response(200, json={}))
+    await like_tweet("https://x.com/u/status/42")
+    twikit_client.favorite_tweet.assert_awaited_once_with("42")
+
+
+@pytest.mark.parametrize("cookie", ["abc def", "abc\\n", "tok;x=1", "é"])
+def test_malformed_cookies_are_rejected_without_echo(monkeypatch, cookie):
+    monkeypatch.setenv("TWITTER_CT0", cookie)
+    with pytest.raises(ToolError) as info:
+        get_auth_context(None, http_mode=False)
+    assert "malformed" in str(info.value)
+    assert cookie not in str(info.value)
+    with pytest.raises(ToolError, match="malformed"):
+        parse_bearer(f"Bearer tok:{cookie}" if " " not in cookie else "Bearer tok:a;b")
+
+
+def test_long_x_bodies_are_cut():
+    with pytest.raises(ToolError) as info, twitter_errors():
+        raise errors.ServerError("status: 503, message: " + "<html>" * 5000)
+    assert len(str(info.value)) < 500
+
+
+def test_local_protocol_error_is_not_echoed():
+    with pytest.raises(ToolError) as info, twitter_errors():
+        raise httpx.LocalProtocolError("Illegal header value b'SECRETCOOKIE'")
+    assert "SECRETCOOKIE" not in str(info.value)
+
+
+async def test_xclient_reports_exhausted_retries(fake_transaction):
+    with patch.object(main.Client, "request", AsyncMock(side_effect=code34())) as req:
+        with pytest.raises(main.TransactionRejected):
+            await main.XClient("en-US").request("GET", "https://x.com/i/api/x")
+    assert req.await_count == main.XClient.RETRIES + 1
+
+
+async def test_xclient_handshake_keeps_x_errors(monkeypatch):
+    class RateLimited(FakeTransaction):
+        async def init(self, session, headers):
+            raise errors.TooManyRequests("429")
+
+    monkeypatch.setattr(main, "XTransaction", RateLimited)
+    with pytest.raises(errors.TooManyRequests):
+        await main.XClient("en-US").handshake()
+
+
+async def test_xclient_handshake_restores_cookies(monkeypatch):
+    class Clobbers(FakeTransaction):
+        async def init(self, session, headers):
+            session.cookies.set("junk", "1", domain=".x.com")
+            await super().init(session, headers)
+
+    monkeypatch.setattr(main, "XTransaction", Clobbers)
+    FakeTransaction.fail_next = 0
+    client = main.XClient("en-US")
+    client.set_cookies({"auth_token": "tok", "ct0": "csrf"})
+    await client.handshake()
+    assert client.get_cookies() == {"auth_token": "tok", "ct0": "csrf"}
+
+
+async def test_like_already_liked_is_success(twikit_client):
+    body = {
+        "errors": [{"code": 139, "message": "You have already favorited this status."}]
+    }
+    twikit_client.favorite_tweet = AsyncMock(
+        return_value=httpx.Response(200, json=body)
+    )
+    assert json.loads(await like_tweet("1")) == {
+        "status": "success",
+        "already_done": True,
+    }
+
+
+async def test_evicted_client_closes_after_its_last_call(monkeypatch):
+    monkeypatch.setattr(main, "_MAX_CLIENTS", 1)
+    made = []
+
+    def make(_lang):
+        made.append(new_twikit_mock())
+        return made[-1]
+
+    with patch("main.XClient", side_effect=make):
+        async with main.x_client(None) as first:
+            monkeypatch.setenv("TWITTER_AUTH_TOKEN", "tok2")
+            await get_client(None)  # evicts `first` while it is in use
+            assert first.evicted
+            first.http.aclose.assert_not_awaited()
+        first.http.aclose.assert_awaited_once()
+
+
+async def test_cache_is_least_recently_used(monkeypatch):
+    monkeypatch.setattr(main, "_MAX_CLIENTS", 2)
+    made = {}
+
+    def make(_lang):
+        client = new_twikit_mock()
+        made[os.environ["TWITTER_AUTH_TOKEN"]] = client
+        return client
+
+    with patch("main.XClient", side_effect=make):
+        for token in ["a", "b", "a", "c"]:  # "a" used again, so "b" is oldest
+            monkeypatch.setenv("TWITTER_AUTH_TOKEN", token)
+            await get_client(None)
+    made["b"].http.aclose.assert_awaited_once()
+    made["a"].http.aclose.assert_not_awaited()
+
+
+async def test_one_slow_handshake_does_not_block_other_users(monkeypatch):
+    monkeypatch.setattr(main, "HTTP_MODE", True)
+    order = []
+
+    def make(_lang):
+        client = new_twikit_mock()
+
+        async def handshake():
+            token = client.set_cookies.call_args.args[0]["auth_token"]
+            await asyncio.sleep(0.2 if token == "slow" else 0)
+            order.append(token)
+
+        client.handshake = AsyncMock(side_effect=handshake)
+        return client
+
+    def ctx(token):
+        return SimpleNamespace(headers={"authorization": f"Bearer {token}:c"})
+
+    with patch("main.XClient", side_effect=make):
+        await asyncio.gather(get_client(ctx("slow")), get_client(ctx("fast")))
+    assert order == ["fast", "slow"]
+
+
+def test_iso_time():
+    assert (
+        main.iso_time("Thu Oct 01 17:31:51 +0000 2026") == "2026-10-01T17:31:51+00:00"
+    )
+    assert main.iso_time("garbage") == "garbage"
+    assert main.iso_time(None) is None
+
+
+async def test_get_profile_expands_urls(twikit_client):
+    user = make_user()
+    user.url = "https://t.co/site"
+    user.urls = [{"url": "https://t.co/site", "expanded_url": "https://example.com"}]
+    user.description = "Docs at https://t.co/doc"
+    user.description_urls = [
+        {"url": "https://t.co/doc", "expanded_url": "https://docs.ex"}
+    ]
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=user)
+    data = json.loads(await get_profile("testuser"))
+    assert data["url"] == "https://example.com"
+    assert data["description"] == "Docs at https://docs.ex"
+    assert data["protected"] is False and data["following"] is False
+
+
+async def test_schema_carries_parameter_docs_and_no_wrapped_output():
+    async with MCPClient(main.mcp) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    count = tools["get_tweets"].input_schema["properties"]["count"]
+    assert count["minimum"] == 1 and count["maximum"] == 50 and "description" in count
+    username = tools["get_tweets"].input_schema["properties"]["username"]
+    assert "@" in username["description"]
+    assert all(t.output_schema is None for t in tools.values())
+
+
+async def test_tool_result_is_plain_json_text(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    async with MCPClient(main.mcp) as client:
+        result = await client.call_tool("get_profile", {"username": "@testuser"})
+    assert not result.is_error
+    assert result.structured_content is None
+    assert json.loads(result.content[0].text)["username"] == "testuser"
+
+
+async def test_count_out_of_range_rejected_by_schema(twikit_client):
+    async with MCPClient(main.mcp) as client:
+        result = await client.call_tool("get_trends", {"count": 51})
+    assert result.is_error
+
+
+# --- real twikit parsers on realistic responses -------------------------------
+
+
+def tweet_entry(raw: dict) -> dict:
+    return {
+        "entryId": f"tweet-{raw['rest_id']}",
+        "content": {
+            "entryType": "TimelineTimelineItem",
+            "itemContent": {
+                "itemType": "TimelineTweet",
+                "tweet_results": {"result": raw},
+            },
+        },
+    }
+
+
+def cursor_entry(kind: str, value: str) -> dict:
+    return {
+        "entryId": f"cursor-{kind}-{value}",
+        "content": {
+            "entryType": "TimelineTimelineCursor",
+            "value": value,
+            "cursorType": kind,
+        },
+    }
+
+
+@pytest.fixture
+def real_client(monkeypatch):
+    """A real XClient (real twikit parsing) whose handshake and GraphQL
+    calls are stubbed; tests set the GraphQL responses."""
+    client = main.XClient("en-US")
+    client.handshake = AsyncMock()
+    client.get_user_by_screen_name = AsyncMock(return_value=make_user("u"))
+    main._clients[AuthContext("env_token", "env_ct0")] = client
+    return client
+
+
+async def test_get_tweets_real_parser_restores_thread_follow_ups(real_client):
+    old_root = raw_tweet("100")
+    follow_up = raw_tweet("250", reply_to="100")
+    newest = raw_tweet("300")
+    response = {
+        "data": {
+            "user": {
+                "result": {
+                    "timeline": {
+                        "timeline": {
+                            "instructions": [
+                                {
+                                    "type": "TimelineAddEntries",
+                                    "entries": [
+                                        tweet_entry(newest),
+                                        {
+                                            "entryId": "profile-conversation-1",
+                                            "content": {
+                                                "entryType": "TimelineTimelineModule",
+                                                "items": [
+                                                    raw_item(
+                                                        "profile-conversation-1-tweet-100",
+                                                        old_root,
+                                                    ),
+                                                    raw_item(
+                                                        "profile-conversation-1-tweet-250",
+                                                        follow_up,
+                                                    ),
+                                                ],
+                                            },
+                                        },
+                                        cursor_entry("top", "t"),
+                                        cursor_entry("bottom", "b"),
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    real_client.gql.user_tweets = AsyncMock(return_value=(response, None))
+    data = json.loads(await get_tweets("u", count=1 + 2))
+    # The thread's newest post (250) is back, in date order.
+    assert [t["id"] for t in data] == ["300", "250", "100"]
+    assert data[0]["created_at"] == "2024-01-01T00:00:00+00:00"
+
+
+async def test_get_timeline_real_parser_drops_ads_and_keeps_conversations(real_client):
+    promoted = tweet_entry(raw_tweet("666"))
+    promoted["entryId"] = "promoted-tweet-666"
+    promoted_in_item = tweet_entry(raw_tweet("667"))
+    promoted_in_item["content"]["itemContent"]["promotedMetadata"] = {"advertiser": 1}
+    response = {
+        "data": {
+            "home": {
+                "home_timeline_urt": {
+                    "instructions": [
+                        {
+                            "type": "TimelineAddEntries",
+                            "entries": [
+                                cursor_entry("top", "t"),
+                                tweet_entry(raw_tweet("10")),
+                                promoted,
+                                promoted_in_item,
+                                {
+                                    "entryId": "home-conversation-1",
+                                    "content": {
+                                        "entryType": "TimelineTimelineModule",
+                                        "items": [
+                                            raw_item(
+                                                "home-conversation-1-tweet-20",
+                                                raw_tweet("20"),
+                                            ),
+                                            raw_item(
+                                                "home-conversation-1-tweet-21",
+                                                raw_tweet("21", "20"),
+                                            ),
+                                        ],
+                                    },
+                                },
+                                {
+                                    "entryId": "who-to-follow-1",
+                                    "content": {
+                                        "items": [
+                                            {
+                                                "entryId": "u",
+                                                "item": {
+                                                    "itemContent": {
+                                                        "itemType": "TimelineUser"
+                                                    }
+                                                },
+                                            }
+                                        ]
+                                    },
+                                },
+                                cursor_entry("bottom", "b"),
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    fetch = AsyncMock(return_value=(response, None))
+    real_client.gql.home_timeline = main._cleaned(fetch)
+    data = json.loads(await main.get_timeline(category="for-you", count=10))
+    assert [t["id"] for t in data] == ["10", "20", "21"]
+
+
+def test_clean_home_timeline_without_entries_is_untouched():
+    response = {"data": {"home": {}}}
+    assert main.clean_home_timeline(response) == {"data": {"home": {}}}
+
+
+def test_thread_follow_ups_skip_duplicates_and_other_authors():
+    root, own, other = make_tweet(100), make_tweet(250), make_tweet(260)
+    other.user.screen_name = "someone_else"
+    root.replies = [own, other, own]
+    second = make_tweet(250)  # the same follow-up again on the next page
+    out = main.with_thread_follow_ups([root, second], "testuser")
+    assert [t.id for t in out] == ["250", "100"]
