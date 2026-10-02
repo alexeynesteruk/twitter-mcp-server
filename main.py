@@ -135,12 +135,45 @@ def get_auth_context(
     return checked_cookies(auth_token, ct0)
 
 
+# First path segments of x.com URLs that are not profiles.
+NOT_PROFILES = frozenset(
+    {
+        "i",
+        "home",
+        "search",
+        "explore",
+        "intent",
+        "hashtag",
+        "notifications",
+        "messages",
+        "settings",
+        "compose",
+        "share",
+        "login",
+        "logout",
+        "signup",
+        "tos",
+        "privacy",
+        "jobs",
+    }
+)
+
+
 def username_arg(value: str) -> str:
-    """Accept "name", "@name" or a profile URL."""
+    """Accept "name", "@name", "name/" or a profile URL."""
     value = value.strip()
     if "/" in value:
-        path = urlparse(value if "://" in value else f"https://{value}").path
+        if "://" in value:
+            path = urlparse(value).path
+        elif re.match(r"(?:www\.|mobile\.)?(?:x|twitter)\.com/", value, re.IGNORECASE):
+            path = urlparse(f"https://{value}").path
+        else:
+            path = value
         value = path.strip("/").split("/")[0]
+        if value.lower() in NOT_PROFILES:
+            raise ToolError(
+                f"Invalid argument (username): not a profile URL ({value!r})"
+            )
     value = value.removeprefix("@")
     if not re.fullmatch(r"[A-Za-z0-9_]{1,50}", value):
         raise ToolError(f"Invalid argument (username): {value[:60]!r}")
@@ -150,9 +183,9 @@ def username_arg(value: str) -> str:
 def tweet_id_arg(value: str) -> str:
     """Accept a numeric tweet ID or a tweet URL."""
     value = value.strip()
-    if value.isdigit():
+    if re.fullmatch(r"[0-9]{1,25}", value):
         return value
-    match = re.search(r"/status(?:es)?/(\d+)", value)
+    match = re.search(r"/status(?:es)?/([0-9]{1,25})", value)
     if not match:
         raise ToolError(f"Invalid argument (tweet_id): {value[:60]!r}")
     return match.group(1)
@@ -355,7 +388,10 @@ class XClient(Client):
             self.client_transaction = fresh
 
     async def request(self, method, url, *args, **kwargs):
-        for attempt in range(self.RETRIES + 1):
+        # The account-state check twikit makes after a 429 gets no retries:
+        # its failure only means "unknown" (see _get_user_state).
+        retries = 0 if _checking_user_state.get() else self.RETRIES
+        for attempt in range(retries + 1):
             await self.handshake()
             transaction = self.client_transaction
             try:
@@ -363,7 +399,7 @@ class XClient(Client):
             except errors.NotFound as e:
                 if not is_transaction_rejection(e):
                     raise
-                if attempt == self.RETRIES:
+                if attempt == retries:
                     raise TransactionRejected(
                         f"{urlparse(url).path}: {brief(e)}", headers=e.headers
                     ) from e
@@ -382,7 +418,10 @@ class XClient(Client):
         token = _checking_user_state.set(True)
         try:
             return await super()._get_user_state()
-        except errors.TooManyRequests:
+        except errors.AccountSuspended:
+            raise
+        except (errors.TwitterException, httpx.HTTPError, KeyError):
+            # Unknown; the caller then reports the original 429.
             return "normal"
         finally:
             _checking_user_state.reset(token)
@@ -394,6 +433,9 @@ _clients: dict[AuthContext, XClient] = {}
 # Handshakes in progress, one per cookie pair, shared by concurrent callers.
 _pending: dict[AuthContext, asyncio.Future] = {}
 _MAX_CLIENTS = 32
+# HTTP mode: callers with many different (possibly bogus) cookie pairs must
+# not fan out into many simultaneous x.com handshakes.
+_handshake_slots = asyncio.Semaphore(4)
 
 
 async def _retire(client: XClient) -> None:
@@ -408,7 +450,8 @@ async def _create_client(auth: AuthContext) -> XClient:
     # Cache a client only once its handshake worked, so a failed one is never
     # reused and bad cookies (logged-out page, no ondemand.s) never take a slot.
     try:
-        await client.handshake()
+        async with _handshake_slots:
+            await client.handshake()
     except BaseException:
         await client.http.aclose()
         raise
@@ -438,7 +481,10 @@ async def get_client(ctx: Context | None) -> XClient:
                 finished.exception()  # retrieved, even if every caller left
 
         task.add_done_callback(done)
-    return await asyncio.shield(task)
+    # wait() leaves the shared task running if this caller is cancelled
+    # (unlike awaiting it), without shield()'s orphaned-error logging.
+    await asyncio.wait({task})
+    return task.result()
 
 
 @contextmanager
@@ -453,7 +499,7 @@ def twitter_errors() -> Iterator[None]:
             f"The X account is locked; unlock it at x.com in a browser ({brief(e)})"
         ) from None
     except errors.AccountSuspended as e:
-        raise ToolError(f"The X account is suspended ({brief(e)})") from None
+        raise ToolError(f"X reports a suspended account: {brief(e)}") from None
     except errors.Unauthorized:
         raise ToolError(
             f"{AUTH_REQUIRED} (X rejected the session cookies; refresh auth_token/ct0)"
@@ -580,11 +626,12 @@ def tweet_text(tweet: Tweet) -> str:
     """Full text: long-form (note) tweets in full, t.co links expanded, the
     t.co links of attached media dropped (they are listed under "media"),
     and X's HTML escaping (&amp; &lt; &gt;) undone."""
-    text = expand_urls(tweet.full_text, tweet.urls)
+    # Unescape first: expanded links may contain "&copy=" and the like.
+    text = expand_urls(html.unescape(tweet.full_text), tweet.urls)
     for media in tweet.media:
         if media.url:
             text = text.replace(media.url, "")
-    return html.unescape(text).strip()
+    return text.strip()
 
 
 def tweet_to_dict(tweet: Tweet) -> dict[str, Any]:
@@ -606,7 +653,10 @@ def tweet_to_dict(tweet: Tweet) -> dict[str, Any]:
         "retweet_count": source.retweet_count,
     }
     if source.media:
-        data["media"] = [{"type": m.type, "url": m.expanded_url} for m in source.media]
+        data["media"] = [
+            {"type": m.type, "url": m.expanded_url, "media_url": m.media_url}
+            for m in source.media
+        ]
     if original is not None:
         data["retweet_of"] = {
             "id": original.id,
@@ -630,8 +680,11 @@ def tweets_json(tweets, count: int) -> str:
 
 async def collect(result: Result | list, count: int) -> list:
     """Follow X's page cursors until `count` items (X serves ~10-20 a page)."""
-    items = list(result)
-    seen = {getattr(item, "id", None) for item in items}
+    items, seen = [], set()
+    for item in result:
+        if getattr(item, "id", None) not in seen:
+            seen.add(getattr(item, "id", None))
+            items.append(item)
     for _ in range(MAX_PAGES - 1):
         if len(items) >= count or not getattr(result, "next_cursor", None):
             break
@@ -640,6 +693,10 @@ async def collect(result: Result | list, count: int) -> list:
         except (IndexError, KeyError):
             # twikit indexes the last entries of a page; past the end of a
             # timeline X sends none.
+            break
+        except (errors.TwitterException, httpx.HTTPError) as e:
+            # A later page failed (often a 429): keep what we have.
+            logger.warning("Stopped paging after %d items: %s", len(items), brief(e))
             break
         new = [item for item in result if getattr(item, "id", None) not in seen]
         if not new:
@@ -684,11 +741,19 @@ async def get_tweets(
     username = username_arg(username)
     async with x_client(ctx) as client:
         user = await client.get_user_by_screen_name(username)
-        if user.protected and user.following is not True:
-            raise ToolError(f"@{user.screen_name} is protected and not followed")
+        protected = ToolError(f"@{user.screen_name} is protected and not followed")
+        if user.protected and user.following is False:
+            raise protected
         if not user.statuses_count:
             return "[]"
-        tweets = await client.get_user_tweets(user.id, "Tweets", count=count_int)
+        try:
+            tweets = await client.get_user_tweets(user.id, "Tweets", count=count_int)
+        except IndexError:
+            # twikit fails on a timeline without entries, which is what a
+            # protected account shows to non-followers.
+            if user.protected:
+                raise protected from None
+            raise
         tweets = await collect(tweets, count_int)
         return tweets_json(with_thread_follow_ups(tweets, user.screen_name), count_int)
 
@@ -974,14 +1039,16 @@ async def get_replies(
         for _ in range(MAX_PAGES - 1):
             if len(replies) >= count_int or not cursor:
                 break
-            response, _ = await client.gql.tweet_detail(tweet_id, cursor)
-            new = [
-                reply
-                for reply in replies_from_tweet_detail(
+            try:
+                response, _ = await client.gql.tweet_detail(tweet_id, cursor)
+                page = replies_from_tweet_detail(
                     client, tweet_id, response, require_focal=False
                 )
-                if reply.id not in seen
-            ]
+            except (errors.TwitterException, httpx.HTTPError, ToolError) as e:
+                # A later page failed (often a 429): keep what we have.
+                logger.warning("Stopped paging replies: %s", brief(e))
+                break
+            new = [reply for reply in page if reply.id not in seen]
             if not new:
                 break
             seen.update(reply.id for reply in new)

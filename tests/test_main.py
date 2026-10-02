@@ -66,8 +66,10 @@ def stdio_cookies(monkeypatch):
     monkeypatch.setenv("TWITTER_CT0", "env_ct0")
     monkeypatch.setattr(main, "HTTP_MODE", False)
     main._clients.clear()
+    main._pending.clear()
     yield
     main._clients.clear()
+    main._pending.clear()
 
 
 def make_tweet(i) -> Mock:
@@ -403,7 +405,7 @@ async def test_tools_reject_bad_count(count, message):
             "X refused the request \\(403, code 161\\)",
         ),
         (errors.AccountLocked("locked"), "account is locked"),
-        (errors.AccountSuspended("suspended"), "account is suspended"),
+        (errors.AccountSuspended("suspended"), "suspended account"),
         (main.TransactionRejected("/x: 404"), "kept rejecting the request"),
         (errors.UserNotFound("gone"), "User not found"),
         (errors.TweetNotAvailable("gone"), "Not found"),
@@ -1193,12 +1195,17 @@ def test_tweet_to_dict_quote_and_tco_expansion():
             "type": "video",
             "url": "https://t.co/vid",
             "expanded_url": "https://x.com/u/status/8/video/1",
+            "media_url_https": "https://pbs.twimg.com/thumb.jpg",
         }
     ]
     data = main.tweet_to_dict(real_tweet(raw))
     assert data["text"] == "see https://a.b/c"
     assert data["media"] == [
-        {"type": "video", "url": "https://x.com/u/status/8/video/1"}
+        {
+            "type": "video",
+            "url": "https://x.com/u/status/8/video/1",
+            "media_url": "https://pbs.twimg.com/thumb.jpg",
+        }
     ]
     assert data["quoted"] == {"id": "Q", "author_username": "u", "text": "quoted body"}
     assert "retweet_of" not in data
@@ -1673,3 +1680,189 @@ def test_thread_follow_ups_skip_duplicates_and_other_authors():
     second = make_tweet(250)  # the same follow-up again on the next page
     out = main.with_thread_follow_ups([root, second], "testuser")
     assert [t.id for t in out] == ["250", "100"]
+
+
+# ============================================================================
+# Round 3 verification fixes
+# ============================================================================
+
+
+async def test_collect_keeps_pages_when_a_later_page_fails():
+    page = Page(
+        [make_tweet(i) for i in range(11)], end_error=errors.TooManyRequests("429")
+    )
+    got = await main.collect(page, 30)
+    assert len(got) == 11
+
+
+async def test_collect_dedupes_within_first_page():
+    first = Page([make_tweet(1), make_tweet(2), make_tweet(1)])
+    assert [t.id for t in await main.collect(first, 10)] == ["1", "2"]
+
+
+async def test_get_replies_keeps_replies_when_a_later_page_fails(twikit_client):
+    first = raw_detail(raw_tweet("1"), [raw_module(str(i)) for i in range(2, 5)])
+    twikit_client.gql.tweet_detail = AsyncMock(
+        side_effect=[(first, None), errors.TooManyRequests("429")]
+    )
+    data = json.loads(await get_replies("1", count=50))
+    assert [t["id"] for t in data] == ["2", "3", "4"]
+
+
+async def test_get_replies_later_page_without_conversation_stops(twikit_client):
+    first = raw_detail(raw_tweet("1"), [raw_module("2")])
+    twikit_client.gql.tweet_detail = AsyncMock(
+        side_effect=[(first, None), ({"data": {}}, None)]
+    )
+    assert [t["id"] for t in json.loads(await get_replies("1", count=50))] == ["2"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        code34(),
+        errors.Unauthorized("401"),
+        httpx.ConnectError("x"),
+        errors.ServerError("5"),
+    ],
+)
+async def test_user_state_check_failure_means_unknown(fake_transaction, failure):
+    # The nested check twikit makes after a 429: any failure is "unknown",
+    # and it is never retried with fresh handshakes.
+    client = main.XClient("en-US")
+    with patch.object(main.Client, "request", AsyncMock(side_effect=failure)) as req:
+        assert await client._get_user_state() == "normal"
+    assert req.await_count == 1
+    assert fake_transaction.made == 1
+
+
+async def test_user_state_check_keeps_suspension(monkeypatch):
+    async def suspended(self):
+        raise errors.AccountSuspended("suspended")
+
+    monkeypatch.setattr(main.Client, "_get_user_state", suspended)
+    with pytest.raises(errors.AccountSuspended):
+        await main.XClient("en-US")._get_user_state()
+
+
+def test_tweet_text_unescapes_before_expanding_links():
+    raw = raw_tweet("9")
+    raw["legacy"]["full_text"] = "a &amp; b https://t.co/q"
+    raw["legacy"]["entities"]["urls"] = [
+        {"url": "https://t.co/q", "expanded_url": "https://e.x/?id=1&copy=2&reg=3"}
+    ]
+    assert (
+        main.tweet_to_dict(real_tweet(raw))["text"]
+        == "a & b https://e.x/?id=1&copy=2&reg=3"
+    )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("jack/", "jack"),
+        ("user/status/123", "user"),
+        ("mobile.twitter.com/Jack", "Jack"),
+    ],
+)
+def test_username_arg_paths(value, expected):
+    assert main.username_arg(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://x.com/home",
+        "x.com/i/web/status/123",
+        "https://x.com/search?q=a",
+        "x.com/intent/follow",
+    ],
+)
+def test_username_arg_rejects_non_profile_urls(value):
+    with pytest.raises(ToolError, match="not a profile URL"):
+        main.username_arg(value)
+
+
+def test_tweet_id_arg_rejects_non_ascii_digits():
+    with pytest.raises(ToolError):
+        main.tweet_id_arg("١٢٣")
+
+
+async def test_get_tweets_protected_with_unknown_following_is_tried(twikit_client):
+    user = make_user()
+    user.protected, user.following = True, None
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=user)
+    twikit_client.get_user_tweets = AsyncMock(return_value=[make_tweet(5)])
+    assert [t["id"] for t in json.loads(await get_tweets("testuser"))] == ["5"]
+
+
+async def test_get_tweets_protected_empty_timeline_says_protected(twikit_client):
+    user = make_user()
+    user.protected, user.following = True, None
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=user)
+    twikit_client.get_user_tweets = AsyncMock(
+        side_effect=IndexError("list index out of range")
+    )
+    with pytest.raises(ToolError, match="protected and not followed"):
+        await get_tweets("testuser")
+
+
+async def test_concurrent_handshakes_are_capped(monkeypatch):
+    monkeypatch.setattr(main, "HTTP_MODE", True)
+    monkeypatch.setattr(main, "_handshake_slots", asyncio.Semaphore(2))
+    running = peak = 0
+
+    def make(_lang):
+        client = new_twikit_mock()
+
+        async def handshake():
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.02)
+            running -= 1
+
+        client.handshake = AsyncMock(side_effect=handshake)
+        return client
+
+    def ctx(i):
+        return SimpleNamespace(headers={"authorization": f"Bearer tok{i}:c"})
+
+    with patch("main.XClient", side_effect=make):
+        await asyncio.gather(*(get_client(ctx(i)) for i in range(6)))
+    assert peak == 2
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_handshake():
+    started = asyncio.Event()
+    clients = []
+
+    def make(_lang):
+        client = new_twikit_mock()
+
+        async def handshake():
+            started.set()
+            await asyncio.sleep(0.05)
+
+        client.handshake = AsyncMock(side_effect=handshake)
+        clients.append(client)
+        return client
+
+    with patch("main.XClient", side_effect=make):
+        first = asyncio.ensure_future(get_client(None))
+        await started.wait()
+        second = asyncio.ensure_future(get_client(None))
+        await asyncio.sleep(0)
+        first.cancel()
+        assert await second is clients[0]
+    assert len(clients) == 1
+    assert list(main._clients.values()) == clients
+
+
+async def test_get_tweets_public_index_error_is_shape_error(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    twikit_client.get_user_tweets = AsyncMock(
+        side_effect=IndexError("list index out of range")
+    )
+    with pytest.raises(ToolError, match="Unexpected X response shape"):
+        await get_tweets("testuser")
