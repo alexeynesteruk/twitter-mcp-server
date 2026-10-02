@@ -94,6 +94,16 @@ def is_transaction_rejection(e: errors.NotFound) -> bool:
     return '"code":34' in message or message.endswith('message: ""')
 
 
+class HandshakeError(Exception):
+    """The x.com handshake (transaction keys scraped off the home page) failed.
+
+    twikit raises bare Exceptions here ("Couldn't get KEY_BYTE indices",
+    "Couldn't get key from the page source", "invalid response"); x.com
+    serves a page without them when the cookies are logged out, or after a
+    format change that twikit needs re-patching for.
+    """
+
+
 class XClient(Client):
     """twikit Client with a serialized, retryable x.com handshake.
 
@@ -129,17 +139,23 @@ class XClient(Client):
                 return
             fresh = ClientTransaction()
             cookies = self.get_cookies().copy()
-            # Same headers twikit's Client.request uses for its own handshake.
-            await fresh.init(
-                self.http,
-                {
-                    "Accept-Language": f"{self.language},{self.language.split('-')[0]};q=0.9",
-                    "Cache-Control": "no-cache",
-                    "Referer": f"https://{DOMAIN}",
-                    "User-Agent": self._user_agent,
-                },
-            )
-            self.set_cookies(cookies, clear_cookies=True)
+            try:
+                # Same headers twikit's Client.request uses for its own handshake.
+                await fresh.init(
+                    self.http,
+                    {
+                        "Accept-Language": f"{self.language},{self.language.split('-')[0]};q=0.9",
+                        "Cache-Control": "no-cache",
+                        "Referer": f"https://{DOMAIN}",
+                        "User-Agent": self._user_agent,
+                    },
+                )
+            except (errors.TwitterException, httpx.HTTPError):
+                raise
+            except Exception as e:
+                raise HandshakeError(str(e)) from e
+            finally:
+                self.set_cookies(cookies, clear_cookies=True)
             self.client_transaction = fresh
 
     async def request(self, method, url, *args, **kwargs):
@@ -227,15 +243,11 @@ def twitter_errors() -> Iterator[None]:
             f"Unexpected X response shape ({type(e).__name__}: {e}); "
             "twikit likely needs re-patching"
         ) from None
-    except Exception as e:
-        # twikit raises a bare Exception when x.com serves a page without the
-        # ondemand.s script: a logged-out page (bad cookies) or a format change.
-        if "KEY_BYTE" not in str(e):
-            raise
+    except HandshakeError as e:
         raise ToolError(
             f"{AUTH_REQUIRED} (X client handshake failed: {e}). Usually invalid or "
             "expired auth_token/ct0; if the cookies are fresh, X changed its "
-            "ondemand.s format and twikit needs re-patching"
+            "home page format and twikit needs re-patching"
         ) from None
 
 

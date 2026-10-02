@@ -214,11 +214,39 @@ async def test_xclient_failed_handshake_is_not_published(fake_transaction):
     client = main.XClient("en-US")
     before = client.client_transaction
     fake_transaction.fail_next = 1
-    with pytest.raises(Exception, match="KEY_BYTE"):
+    with pytest.raises(main.HandshakeError, match="KEY_BYTE"):
         await client.handshake()
     assert client.client_transaction is before
     await client.handshake()
     assert client.client_transaction.home_page_response is not None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Couldn't get KEY_BYTE indices",
+        "Couldn't get key from the page source",
+        "invalid response",
+    ],
+)
+async def test_xclient_wraps_every_bare_handshake_failure(monkeypatch, message):
+    class Broken(FakeTransaction):
+        async def init(self, session, headers):
+            raise Exception(message)
+
+    monkeypatch.setattr(main, "ClientTransaction", Broken)
+    with pytest.raises(main.HandshakeError, match=message):
+        await main.XClient("en-US").handshake()
+
+
+async def test_xclient_handshake_keeps_network_and_x_errors(monkeypatch):
+    class Offline(FakeTransaction):
+        async def init(self, session, headers):
+            raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(main, "ClientTransaction", Offline)
+    with pytest.raises(httpx.ConnectError):
+        await main.XClient("en-US").handshake()
 
 
 async def test_xclient_stale_handshake_replaced_once(fake_transaction):
@@ -241,7 +269,7 @@ async def test_client_is_reused_per_cookie_pair(twikit_client):
 
 async def test_failed_handshake_is_not_cached():
     broken, healthy = new_twikit_mock(), new_twikit_mock()
-    broken.handshake.side_effect = Exception("Couldn't get KEY_BYTE indices")
+    broken.handshake.side_effect = main.HandshakeError("Couldn't get KEY_BYTE indices")
     healthy.get_user_by_screen_name = AsyncMock(return_value=make_user())
     with patch("main.XClient", side_effect=[broken, healthy]):
         with pytest.raises(ToolError, match="handshake failed"):
@@ -332,7 +360,10 @@ async def test_tools_reject_bad_count(count, message):
         (httpx.ConnectError("boom"), "Network error.*ConnectError"),
         (KeyError("itemContent"), "Unexpected X response shape.*itemContent"),
         (AttributeError("json"), "Unexpected X response shape"),
-        (Exception("Couldn't get KEY_BYTE indices"), "AUTH_REQUIRED.*handshake"),
+        (
+            main.HandshakeError("Couldn't get key from the page source"),
+            "AUTH_REQUIRED.*handshake",
+        ),
     ],
 )
 def test_twitter_errors_mapping(exc, message):
@@ -683,3 +714,252 @@ async def test_http_bearer_cookies_are_used(monkeypatch, twikit_client):
     twikit_client.set_cookies.assert_called_once_with(
         {"auth_token": "tok", "ct0": "csrf"}
     )
+
+
+# ============================================================================
+# Replies against twikit's real tweet_from_data (shapes from live X responses)
+# ============================================================================
+
+LEGACY_USER = {
+    "created_at": "Mon Jan 01 00:00:00 +0000 2020",
+    "name": "N",
+    "screen_name": "u",
+    "profile_image_url_https": "x",
+    "location": "",
+    "description": "",
+    "entities": {},
+    "verified": False,
+    "possibly_sensitive": False,
+    "can_dm": False,
+    "can_media_tag": False,
+    "want_retweets": False,
+    "default_profile": True,
+    "default_profile_image": False,
+    "has_custom_timelines": False,
+    "followers_count": 1,
+    "fast_followers_count": 0,
+    "normal_followers_count": 1,
+    "friends_count": 1,
+    "favourites_count": 0,
+    "listed_count": 0,
+    "media_count": 0,
+    "statuses_count": 1,
+    "is_translator": False,
+    "translator_type": "none",
+}
+
+
+def raw_tweet(tid, reply_to=None, quoted=None) -> dict:
+    t = {
+        "__typename": "Tweet",
+        "rest_id": tid,
+        "core": {
+            "user_results": {
+                "result": {
+                    "__typename": "User",
+                    "rest_id": "9",
+                    "is_blue_verified": False,
+                    "legacy": dict(LEGACY_USER),
+                }
+            }
+        },
+        "views": {"count": "5", "state": "EnabledWithCount"},
+        "legacy": {
+            "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+            "full_text": f"t{tid}",
+            "lang": "en",
+            "in_reply_to_status_id_str": reply_to,
+            "reply_count": 0,
+            "favorite_count": 0,
+            "retweet_count": 0,
+            "is_quote_status": False,
+        },
+    }
+    if quoted:
+        t["quoted_status_result"] = {"result": quoted}
+    return t
+
+
+def raw_item(entry_id, result) -> dict:
+    return {
+        "entryId": entry_id,
+        "item": {
+            "itemContent": {
+                "itemType": "TimelineTweet",
+                "__typename": "TimelineTweet",
+                "tweet_results": {"result": result},
+            }
+        },
+    }
+
+
+def raw_module(rid, subs=(), first=None) -> dict:
+    items = [
+        raw_item(f"conversationthread-{rid}-tweet-{rid}", first or raw_tweet(rid, "1"))
+    ]
+    items += [
+        raw_item(f"conversationthread-{rid}-tweet-{s}", raw_tweet(s, rid)) for s in subs
+    ]
+    items.append(
+        {
+            "entryId": f"conversationthread-{rid}-cursor-showmore-77",
+            "item": {
+                "itemContent": {
+                    "itemType": "TimelineTimelineCursor",
+                    "value": "c",
+                    "cursorType": "ShowMore",
+                }
+            },
+        }
+    )
+    return {
+        "entryId": f"conversationthread-{rid}",
+        "content": {"__typename": "TimelineTimelineModule", "items": items},
+    }
+
+
+def raw_detail(focal_result, entries_after=()) -> dict:
+    entries = [
+        # Ancestor: the focal tweet is itself a reply.
+        {
+            "entryId": "tweet-0",
+            "content": {"itemContent": {"tweet_results": {"result": raw_tweet("0")}}},
+        },
+        {
+            "entryId": "tweet-1",
+            "content": {"itemContent": {"tweet_results": {"result": focal_result}}},
+        },
+        *entries_after,
+        {
+            "entryId": "cursor-bottom-1",
+            "content": {"__typename": "TimelineTimelineCursor", "value": "abc"},
+        },
+    ]
+    return {
+        "data": {
+            "threaded_conversation_with_injections_v2": {
+                "instructions": [
+                    {"type": "TimelineClearCache"},
+                    {"type": "TimelineAddEntries", "entries": entries},
+                ]
+            }
+        }
+    }
+
+
+def test_replies_real_parser_handles_live_shapes():
+    response = raw_detail(
+        raw_tweet("1", "0"),
+        [
+            raw_module("2", ["2a"]),
+            raw_module("3", first={"__typename": "TweetTombstone", "tombstone": {}}),
+            raw_module(
+                "4",
+                first={
+                    "__typename": "TweetWithVisibilityResults",
+                    "tweet": raw_tweet("4", "1"),
+                },
+            ),
+            raw_module("5", first=raw_tweet("5", "1", quoted=raw_tweet("Q"))),
+            {
+                "entryId": "tweetdetailrelatedtweets-1",
+                "content": {"items": [raw_item("x-tweet-R", raw_tweet("R"))]},
+            },
+        ],
+    )
+    replies = replies_from_tweet_detail(Mock(), "1", response)
+    # Ancestor, tombstone, sub-replies, show-more cursor and related tweets are skipped.
+    assert [r.id for r in replies] == ["2", "4", "5"]
+    assert json.loads(main.tweets_json(replies, 50))[0]["text"] == "t2"
+
+
+@pytest.mark.parametrize(
+    "focal",
+    [
+        {"__typename": "TweetTombstone"},
+        {"__typename": "TweetUnavailable", "reason": "Protected"},
+    ],
+)
+def test_replies_real_parser_unavailable_focal(focal):
+    with pytest.raises(ToolError, match="Not found: tweet 1"):
+        replies_from_tweet_detail(Mock(), "1", raw_detail(focal))
+
+
+def test_replies_real_parser_errors_response():
+    response = {
+        "errors": [{"message": "No status found with that ID.", "code": 144}],
+        "data": {},
+    }
+    with pytest.raises(ToolError, match="Not found"):
+        replies_from_tweet_detail(Mock(), "1", response)
+
+
+async def test_get_replies_shape_break_and_non_json_are_tool_errors(twikit_client):
+    broken = raw_detail(raw_tweet("1"), [raw_module("2")])
+    entries = broken["data"]["threaded_conversation_with_injections_v2"][
+        "instructions"
+    ][1]["entries"]
+    del entries[2]["content"]["items"][0]["item"]["itemContent"]["tweet_results"][
+        "result"
+    ]["legacy"]["full_text"]
+    twikit_client.gql.tweet_detail = AsyncMock(return_value=(broken, None))
+    with pytest.raises(ToolError, match="Unexpected X response shape"):
+        await get_replies("1")
+
+    twikit_client.gql.tweet_detail = AsyncMock(return_value=("<html>oops</html>", None))
+    with pytest.raises(ToolError, match="Unexpected X response shape"):
+        await get_replies("1")
+
+
+@pytest.mark.parametrize(
+    "action,method", [("retweet", "retweet"), ("undo", "delete_retweet")]
+)
+async def test_retweet(twikit_client, action, method):
+    ok = httpx.Response(200, json={"data": {}})
+    setattr(twikit_client, method, AsyncMock(return_value=ok))
+    data = json.loads(await main.retweet("123", action=action))
+    assert data["status"] == "success"
+    getattr(twikit_client, method).assert_called_once_with("123")
+
+
+async def test_retweet_reports_daily_limit(twikit_client):
+    # Real 200 body seen live on 2026-10-01.
+    body = {
+        "data": {},
+        "errors": [
+            {
+                "code": 344,
+                "message": "Authorization: You have reached your daily limit for "
+                "sending Tweets and messages. Please try again later.",
+            }
+        ],
+    }
+    twikit_client.retweet = AsyncMock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(ToolError, match="rejected the action.*daily limit"):
+        await main.retweet("123")
+
+
+@pytest.mark.parametrize(
+    "action,method", [("follow", "follow_user"), ("unfollow", "unfollow_user")]
+)
+async def test_follow_user(twikit_client, action, method):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    setattr(twikit_client, method, AsyncMock())
+    data = json.loads(await main.follow_user("testuser", action=action))
+    assert data["status"] == "success"
+    getattr(twikit_client, method).assert_called_once_with("123")
+
+
+@pytest.mark.parametrize(
+    "category,method",
+    [("for-you", "get_timeline"), ("following", "get_latest_timeline")],
+)
+async def test_get_timeline(twikit_client, category, method):
+    setattr(
+        twikit_client,
+        method,
+        AsyncMock(return_value=[make_tweet(i) for i in range(35)]),
+    )
+    data = json.loads(await main.get_timeline(category=category, count=5))
+    assert len(data) == 5
+    getattr(twikit_client, method).assert_called_once_with(count=5)
