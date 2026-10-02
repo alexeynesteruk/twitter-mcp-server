@@ -44,7 +44,7 @@ Every tool that returns tweets returns a JSON list of:
 | `text` | Full text: long-form posts in full, `t.co` links expanded, HTML entities decoded. For a retweet, the original post's text |
 | `created_at` | ISO 8601, UTC |
 | `lang`, `view_count`, `favorite_count`, `reply_count`, `retweet_count` | Of the original post for retweets |
-| `media` | `[{type, url}]` when the post has photos/videos/GIFs |
+| `media` | `[{type, url, media_url}]` when the post has photos/videos/GIFs (`url` is the x.com media page, `media_url` the image or video thumbnail) |
 | `retweet_of` | `{id, author_username, created_at}` of the original, for retweets |
 | `quoted` | `{id, author_username, text}` of the quoted post, for quote posts |
 
